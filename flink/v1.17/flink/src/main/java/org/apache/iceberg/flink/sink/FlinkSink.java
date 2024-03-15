@@ -77,8 +77,12 @@ public class FlinkSink {
 
   private static final String ICEBERG_STREAM_WRITER_NAME =
       IcebergStreamWriter.class.getSimpleName();
+  private static final String DYNAMIC_ICEBERG_STREAM_WRITER_NAME =
+          DynamicIcebergStreamWriter.class.getSimpleName();
   private static final String ICEBERG_FILES_COMMITTER_NAME =
       IcebergFilesCommitter.class.getSimpleName();
+  private static final String ICEBERG_REFRESH_TABLE_SOURCE_NAME =
+          TableRefreshSource.class.getSimpleName();
 
   private FlinkSink() {}
 
@@ -140,11 +144,36 @@ public class FlinkSink {
     private ReadableConfig readableConfig = new Configuration();
     private final Map<String, String> writeOptions = Maps.newHashMap();
     private FlinkWriteConf flinkWriteConf = null;
+    private Boolean dynamicSchema = false;
+    private DataStream<Schema> schemaRefreshStream = null;
 
     private Builder() {}
 
     private Builder forRowData(DataStream<RowData> newRowDataInput) {
       this.inputCreator = ignored -> newRowDataInput;
+      return this;
+    }
+
+    /**
+     * Configuring the iceberg stream writer if support dynamically changed schema
+     *
+     * @param enable indicate whether it should enable dynamically changed schema
+     * @return {@link Builder} to connect the iceberg table.
+     */
+    public Builder dynamicSchema(Boolean enable) {
+      this.dynamicSchema = enable;
+      return this;
+    }
+
+    /**
+     * Configuring schema refresh stream
+     *
+     * @param stream schema data stream
+     * @return {@link Builder} to connect the iceberg table
+     */
+    public Builder schemaRefreshStream(DataStream<Schema> stream) {
+      this.schemaRefreshStream = stream;
+      this.dynamicSchema = true;
       return this;
     }
 
@@ -478,20 +507,49 @@ public class FlinkSink {
         tableSupplier = () -> serializableTable;
       }
 
-      IcebergStreamWriter<RowData> streamWriter =
-          createStreamWriter(tableSupplier, flinkWriteConf, flinkRowType, equalityFieldIds);
+      SingleOutputStreamOperator<WriteResult> writerStream;
+      if (dynamicSchema) {
+          if (schemaRefreshStream == null) {
+              schemaRefreshStream =
+                      input
+                              .getExecutionEnvironment()
+                              .addSource(new TableRefreshSource(tableLoader))
+                              .name(operatorName(ICEBERG_REFRESH_TABLE_SOURCE_NAME))
+                              .broadcast();
+          }
+          DynamicIcebergStreamWriter<RowData> streamWriter =
+                  createDynamicStreamWriter(table, flinkWriteConf, flinkRowType, equalityFieldIds);
+          writerStream =
+                  input
+                          .connect(schemaRefreshStream)
+                          .transform(
+                                  operatorName(DYNAMIC_ICEBERG_STREAM_WRITER_NAME),
+                                  TypeInformation.of(WriteResult.class),
+                                  streamWriter);
+      } else {
+          IcebergStreamWriter<RowData> streamWriter =
+                  createStreamWriter(tableSupplier, flinkWriteConf, flinkRowType, equalityFieldIds);
+          writerStream =
+                  input.transform(
+                          operatorName(ICEBERG_STREAM_WRITER_NAME),
+                          TypeInformation.of(WriteResult.class),
+                          streamWriter);
+      }
+//      IcebergStreamWriter<RowData> streamWriter =
+//          createStreamWriter(tableSupplier, flinkWriteConf, flinkRowType, equalityFieldIds);
 
       int parallelism =
           flinkWriteConf.writeParallelism() == null
               ? input.getParallelism()
               : flinkWriteConf.writeParallelism();
-      SingleOutputStreamOperator<WriteResult> writerStream =
-          input
-              .transform(
-                  operatorName(ICEBERG_STREAM_WRITER_NAME),
-                  TypeInformation.of(WriteResult.class),
-                  streamWriter)
-              .setParallelism(parallelism);
+//      SingleOutputStreamOperator<WriteResult> writerStream =
+//          input
+//              .transform(
+//                  operatorName(ICEBERG_STREAM_WRITER_NAME),
+//                  TypeInformation.of(WriteResult.class),
+//                  streamWriter)
+//              .setParallelism(parallelism);
+        writerStream = writerStream.setParallelism(parallelism);
       if (uidPrefix != null) {
         writerStream = writerStream.uid(uidPrefix + "-writer");
       }
@@ -598,18 +656,48 @@ public class FlinkSink {
 
     Table initTable = tableSupplier.get();
     FileFormat format = flinkWriteConf.dataFileFormat();
-    TaskWriterFactory<RowData> taskWriterFactory =
-        new RowDataTaskWriterFactory(
-            tableSupplier,
-            flinkRowType,
-            flinkWriteConf.targetDataFileSize(),
-            format,
-            writeProperties(initTable, format, flinkWriteConf),
-            equalityFieldIds,
-            flinkWriteConf.upsertMode());
+//    TaskWriterFactory<RowData> taskWriterFactory =
+//        new RowDataTaskWriterFactory(
+//            tableSupplier,
+//            flinkRowType,
+//            flinkWriteConf.targetDataFileSize(),
+//            format,
+//            writeProperties(initTable, format, flinkWriteConf),
+//            equalityFieldIds,
+//            flinkWriteConf.upsertMode());
+      TaskWriterFactory<RowData> taskWriterFactory =
+              buildRowDataTaskWriterFactory(initTable, flinkWriteConf, flinkRowType, equalityFieldIds,writeProperties(initTable, format, flinkWriteConf));
 
     return new IcebergStreamWriter<>(initTable.name(), taskWriterFactory);
   }
+
+    static DynamicIcebergStreamWriter<RowData> createDynamicStreamWriter(
+            Table table,
+            FlinkWriteConf flinkWriteConf,
+            RowType flinkRowType,
+            List<Integer> equalityFieldIds) {
+        TaskWriterFactory<RowData> taskWriterFactory =
+                buildRowDataTaskWriterFactory(table, flinkWriteConf, flinkRowType, equalityFieldIds,writeProperties(table,flinkWriteConf.dataFileFormat(),flinkWriteConf));
+        return new DynamicIcebergStreamWriter<>(table.name(), taskWriterFactory);
+    }
+
+    private static TaskWriterFactory<RowData> buildRowDataTaskWriterFactory(
+            Table table,
+            FlinkWriteConf flinkWriteConf,
+            RowType flinkRowType,
+            List<Integer> equalityFieldIds,
+            Map<String, String> writeProperties) {
+        Preconditions.checkArgument(table != null, "Iceberg table shouldn't be null");
+        Table serializableTable = SerializableTable.copyOf(table);
+        return new RowDataTaskWriterFactory(
+                serializableTable,
+                flinkRowType,
+                flinkWriteConf.targetDataFileSize(),
+                flinkWriteConf.dataFileFormat(),
+                writeProperties,
+                equalityFieldIds,
+                flinkWriteConf.upsertMode());
+    }
 
   /**
    * Based on the {@link FileFormat} overwrites the table level compression properties for the table

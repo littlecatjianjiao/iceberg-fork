@@ -43,15 +43,19 @@ import org.apache.iceberg.util.SerializableSupplier;
 
 public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
   private final Supplier<Table> tableSupplier;
-  private final Schema schema;
-  private final RowType flinkSchema;
+//  private final Schema schema;
+//  private final RowType flinkSchema;
   private final PartitionSpec spec;
   private final long targetFileSizeBytes;
   private final FileFormat format;
   private final List<Integer> equalityFieldIds;
   private final boolean upsert;
-  private final FileAppenderFactory<RowData> appenderFactory;
+//  private final FileAppenderFactory<RowData> appenderFactory;
 
+  private Schema schema;
+  private RowType flinkSchema;
+  private FileAppenderFactory<RowData> appenderFactory;
+  private Map<String, String> writeProperties;
   private transient OutputFileFactory outputFileFactory;
 
   public RowDataTaskWriterFactory(
@@ -81,6 +85,7 @@ public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
       List<Integer> equalityFieldIds,
       boolean upsert) {
     this.tableSupplier = tableSupplier;
+    this.writeProperties = writeProperties;
 
     Table table;
     if (tableSupplier instanceof CachingTableSupplier) {
@@ -98,39 +103,43 @@ public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
     this.equalityFieldIds = equalityFieldIds;
     this.upsert = upsert;
 
-    if (equalityFieldIds == null || equalityFieldIds.isEmpty()) {
-      this.appenderFactory =
-          new FlinkAppenderFactory(
-              table, schema, flinkSchema, writeProperties, spec, null, null, null);
-    } else if (upsert) {
-      // In upsert mode, only the new row is emitted using INSERT row kind. Therefore, any column of
-      // the inserted row
-      // may differ from the deleted row other than the primary key fields, and the delete file must
-      // contain values
-      // that are correct for the deleted row. Therefore, only write the equality delete fields.
-      this.appenderFactory =
-          new FlinkAppenderFactory(
-              table,
-              schema,
-              flinkSchema,
-              writeProperties,
-              spec,
-              ArrayUtil.toIntArray(equalityFieldIds),
-              TypeUtil.select(schema, Sets.newHashSet(equalityFieldIds)),
-              null);
-    } else {
-      this.appenderFactory =
-          new FlinkAppenderFactory(
-              table,
-              schema,
-              flinkSchema,
-              writeProperties,
-              spec,
-              ArrayUtil.toIntArray(equalityFieldIds),
-              schema,
-              null);
-    }
+    buildAppenderFactory();
   }
+
+    private void buildAppenderFactory () {
+      if (equalityFieldIds == null || equalityFieldIds.isEmpty()) {
+        this.appenderFactory =
+                new FlinkAppenderFactory(
+                        this.tableSupplier.get(), schema, flinkSchema, writeProperties, spec, null, null, null);
+      } else if (upsert) {
+        // In upsert mode, only the new row is emitted using INSERT row kind. Therefore, any column of
+        // the inserted row
+        // may differ from the deleted row other than the primary key fields, and the delete file must
+        // contain values
+        // that are correct for the deleted row. Therefore, only write the equality delete fields.
+        this.appenderFactory =
+                new FlinkAppenderFactory(
+                        this.tableSupplier.get(),
+                        schema,
+                        flinkSchema,
+                        writeProperties,
+                        spec,
+                        ArrayUtil.toIntArray(equalityFieldIds),
+                        TypeUtil.select(schema, Sets.newHashSet(equalityFieldIds)),
+                        null);
+      } else {
+        this.appenderFactory =
+                new FlinkAppenderFactory(
+                        this.tableSupplier.get(),
+                        schema,
+                        flinkSchema,
+                        writeProperties,
+                        spec,
+                        ArrayUtil.toIntArray(equalityFieldIds),
+                        schema,
+                        null);
+      }
+    }
 
   @Override
   public void initialize(int taskId, int attemptId) {
@@ -214,6 +223,13 @@ public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
     if (tableSupplier instanceof CachingTableSupplier) {
       ((CachingTableSupplier) tableSupplier).refreshTable();
     }
+  }
+
+  @Override
+  public void rebuildAppenderFactory(Schema newSchema) {
+    this.schema = newSchema;
+    this.flinkSchema = FlinkSink.toFlinkRowType(newSchema, null);
+    buildAppenderFactory();
   }
 
   private static class RowDataPartitionedFanoutWriter extends PartitionedFanoutWriter<RowData> {
