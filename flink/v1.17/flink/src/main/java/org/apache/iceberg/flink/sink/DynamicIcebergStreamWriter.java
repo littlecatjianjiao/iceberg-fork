@@ -31,13 +31,9 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 class DynamicIcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
         implements TwoInputStreamOperator<T, Schema, WriteResult>, BoundedOneInput {
-
-    private static final Logger LOG = LoggerFactory.getLogger(DynamicIcebergStreamWriter.class);
 
     private static final long serialVersionUID = 1L;
 
@@ -78,7 +74,6 @@ class DynamicIcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
 
     @Override
     public void processElement2(StreamRecord<Schema> element) throws Exception {
-        LOG.warn("DynamicIcebergStreamWriter invole proccesEle2 {}", element.getValue());
         taskWriterFactory.rebuildAppenderFactory(element.getValue());
         if (writer != null) {
             emit(writer.complete());
